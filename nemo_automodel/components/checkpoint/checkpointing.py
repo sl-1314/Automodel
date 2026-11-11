@@ -1206,7 +1206,13 @@ class Checkpointer:
             # checkpoint keys differ from their module hierarchy (e.g.
             # "language_model.model.X" vs "model.language_model.X") would silently
             # fail to load base weights when using strict=False.
-            if key_mapping and state_dict_from_disk:
+            # State-dict adapters own the complete checkpoint->internal conversion
+            # (same policy as the DCP path's reader_key_mapping=None below):
+            # _maybe_adapt_state_dict_from_hf has already emitted internal FQNs,
+            # and transformers' model_type mapping then renames serialized module
+            # names (wq_a/wkv/q_norm/...) to HF names (q_a_proj/kv_proj/...),
+            # silently dropping every renamed key from the strict=False load.
+            if key_mapping and state_dict_from_disk and not has_state_dict_adapter:
                 state_dict_from_disk = _apply_key_mapping(state_dict_from_disk, key_mapping)
 
             materialized_tied_lm_head = materialize_missing_tied_lm_head(

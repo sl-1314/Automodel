@@ -40,6 +40,20 @@ import torch.nn.functional as F
 os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
 
 
+def _recompute_grads(ref, dy, leaves):
+    """torch.autograd.grad on a recompute reference, tolerating non-grad
+    leaves (frozen parameters, e.g. experts frozen for the C8 training step):
+    only the leaves that require grad are differentiated; the others were
+    constants in the reference graph and get None back (same contract as
+    ``ctx.needs_input_grad`` in BILinear.backward)."""
+    active = [l for l in leaves if l.requires_grad]
+    if not active:
+        return [None] * len(leaves)
+    grads = torch.autograd.grad(ref, active, grad_outputs=dy.to(ref.dtype))
+    it = iter(grads)
+    return [next(it) if l.requires_grad else None for l in leaves]
+
+
 # ----------------------------------------------------------------------------
 # module 1: BI linear GEMM
 # ----------------------------------------------------------------------------
@@ -297,7 +311,7 @@ class GDNCore(torch.autograd.Function):
         ]
         with torch.enable_grad():
             ref = gdn_ref(*leaves, dims)
-            grads = torch.autograd.grad(ref, leaves, grad_outputs=dy.to(ref.dtype))
+            grads = _recompute_grads(ref, dy, leaves)
         return tuple(grads) + (None,)
 
 
@@ -401,8 +415,8 @@ class MoERouted(torch.autograd.Function):
                 c3 = torch.matmul(c2, w2l[e].t())  # [n, H]
                 out[tok, slot] = c3.float()
             routed = (out * twl[..., None]).sum(1)
-            grads = torch.autograd.grad(routed, leaves, grad_outputs=dy.to(routed.dtype))
-        return tuple(g if g is not None else None for g in grads) + (None, None, None)
+            grads = _recompute_grads(routed, dy, leaves)
+        return tuple(grads) + (None, None, None)
 
 
 class SiluMul(torch.autograd.Function):
@@ -589,7 +603,7 @@ class FACore(torch.autograd.Function):
         ]
         with torch.enable_grad():
             ref = fa_ref(*leaves, cos_sin, head_dims)
-            grads = torch.autograd.grad(ref, leaves, grad_outputs=dy.to(ref.dtype))
+            grads = _recompute_grads(ref, dy, leaves)
         return tuple(g if g is not None else None for g in grads) + (None, None, None)
 
 

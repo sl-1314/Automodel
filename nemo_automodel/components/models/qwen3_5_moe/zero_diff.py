@@ -284,47 +284,52 @@ def text_backend_zero_diff_forward(
     for key in ("cu_seqlens", "max_seqlen", "_packed_seq_ids", "packed_token_indices"):
         assert key not in attn_kwargs, f"packing metadata '{key}' unsupported by the 0-diff recipe"
 
-    if inputs_embeds is None:
-        hidden = self.embed_tokens(input_ids)  # [B, L, H]
-    else:
-        hidden = inputs_embeds
-    B, L, H = hidden.shape
-    assert B == 1, "0-diff recipe is single-sequence"
-
-    cur = hidden.reshape(-1, H)
-    residual = None
-    for layer in self.layers.values():
-        w1 = layer.input_layernorm.weight
-        w2 = layer.post_attention_layernorm.weight
-        eps = layer.input_layernorm.eps
-
-        if residual is None:
-            residual = cur
-            y = GemmaRMSNormFn.apply(cur, w1, eps)
+    # The trainer engine wraps the whole module call in torch.autocast(bf16);
+    # the recipe's ops (torch.sigmoid, +, cat) must run at their native bf16
+    # to keep the validated bitwise numerics, so disable autocast locally.
+    # (The recipe's kernels are CUDA-only, so a fixed device_type is fine.)
+    with torch.autocast(device_type="cuda", enabled=False):
+        if inputs_embeds is None:
+            hidden = self.embed_tokens(input_ids)  # [B, L, H]
         else:
-            y, residual = GemmaAddRMSNormFn.apply(cur, residual, w1, eps)
+            hidden = inputs_embeds
+        B, L, H = hidden.shape
+        assert B == 1, "0-diff recipe is single-sequence"
 
-        if layer.layer_type == "linear_attention":
-            attn_out = layer.linear_attn(hidden_states=y, attention_mask=None)
-        else:
-            attn_out = layer.self_attn(hidden_states=y)
-        if isinstance(attn_out, tuple):
-            attn_out = attn_out[0]
-        attn_out = attn_out.reshape(-1, H)
+        cur = hidden.reshape(-1, H)
+        residual = None
+        for layer in self.layers.values():
+            w1 = layer.input_layernorm.weight
+            w2 = layer.post_attention_layernorm.weight
+            eps = layer.input_layernorm.eps
 
-        y2, residual = GemmaAddRMSNormFn.apply(attn_out, residual, w2, eps)
+            if residual is None:
+                residual = cur
+                y = GemmaRMSNormFn.apply(cur, w1, eps)
+            else:
+                y, residual = GemmaAddRMSNormFn.apply(cur, residual, w1, eps)
 
-        moe_out = layer.mlp(y2.reshape(B, L, H))
-        if isinstance(moe_out, tuple):
-            moe_out = moe_out[0]
-        cur = moe_out.reshape(-1, H)
+            if layer.layer_type == "linear_attention":
+                attn_out = layer.linear_attn(hidden_states=y, attention_mask=None)
+            else:
+                attn_out = layer.self_attn(hidden_states=y)
+            if isinstance(attn_out, tuple):
+                attn_out = attn_out[0]
+            attn_out = attn_out.reshape(-1, H)
 
-    y_final, _ = GemmaAddRMSNormFn.apply(cur, residual, self.norm.weight, self.norm.eps)
-    return Qwen3_5MoeModelOutputWithPast(
-        last_hidden_state=y_final.reshape(B, L, H),
-        past_key_values=None,
-        rope_deltas=None,
-    )
+            y2, residual = GemmaAddRMSNormFn.apply(attn_out, residual, w2, eps)
+
+            moe_out = layer.mlp(y2.reshape(B, L, H))
+            if isinstance(moe_out, tuple):
+                moe_out = moe_out[0]
+            cur = moe_out.reshape(-1, H)
+
+        y_final, _ = GemmaAddRMSNormFn.apply(cur, residual, self.norm.weight, self.norm.eps)
+        return Qwen3_5MoeModelOutputWithPast(
+            last_hidden_state=y_final.reshape(B, L, H),
+            past_key_values=None,
+            rope_deltas=None,
+        )
 
 
 # ----------------------------------------------------------------------------

@@ -634,3 +634,190 @@ class RopeInplaceFn(torch.autograd.Function):
         # so backward uses the opposite orientation.
         dx = _rotate_pairs(g, cos, sin, inverse=not ctx.inverse)
         return dx.flatten(-2).to(grad_out.dtype), None, None, None
+
+
+# ===================== A3: flash_mla recompute bridge =====================
+#
+# V4 paged row layout (kv_layout.cuh traits, cross-checked against the pool
+# byte widths): kDataBytes=576, kScaleBytes=8, kBytesPerToken=584,
+# kPageAlign=576; page row = ceil(page_size*584/576)*576 bytes.
+#   data row of slot s (page-relative): [s*576, s*576+576)
+#     bytes [0:448)   fp8 e4m3, 7 groups of 64 (one ue8m0 scale each)
+#     bytes [448:576) 64 bf16 roped dims (not quantized)
+#   scale row of slot s: [page_size*576 + s*8, +8) — 7 ue8m0 exponent bytes
+#     (scale = 2^(byte-127)) + 1 pad byte.
+# Index-table entries are TOKEN LOCS: page = loc // page_size,
+# slot = loc % page_size.
+
+
+_A3_DEBUG = None  # test hook: dict to stash backward intermediates
+
+
+def _v4_decode_rows(pool, locs, page_size):
+    """Decode V4 paged rows to fp32 K rows [L, 512] (exact: fp8 -> fp32 and
+    bf16 -> fp32 are value-exact, scales are powers of two)."""
+    u8 = pool if pool.dtype == torch.uint8 else pool.view(torch.uint8)
+    locs = locs.to(u8.device).long()
+    page, slot = locs // page_size, locs % page_size
+    cols = torch.arange(576, device=u8.device)
+    data = u8[page.unsqueeze(1), (slot * 576).unsqueeze(1) + cols]
+    scale = u8[page.unsqueeze(1),
+               (page_size * 576 + slot * 8).unsqueeze(1)
+               + torch.arange(8, device=u8.device)]
+    k_fp8 = data[:, :448].view(torch.float8_e4m3fn).float()
+    k_rope = data[:, 448:576].view(torch.bfloat16).float()
+    e = (scale[:, :7].view(torch.uint8).int() - 127).float()
+    k_nope = (k_fp8.view(-1, 7, 64) * torch.pow(2.0, e).unsqueeze(-1)) \
+        .flatten(1)
+    return torch.cat([k_nope, k_rope], dim=1)
+
+
+class FlashMlaFn(torch.autograd.Function):
+    """A3: ``flash_mla_with_kvcache`` with an fp32 recompute backward.
+
+    Forward = the exact engine kernel call (opaque wheel kernel; the value
+    path is bitwise — the closure ``spec["kernel_call"]`` reproduces the
+    engine call site).  Backward recomputes the sparse attention in fp32:
+
+      k(loc)  = V4 decode (see _v4_decode_rows)
+      s       = softmax_scale * q.k   per head
+      Z       = sum_j exp(s_j - m) + exp(sink_h - m)   -- the per-head
+                attn_sink is a VIRTUAL SINK LOGIT: it adds exp(sink) to the
+                softmax denominator (sink token carries no value row);
+                empirically pinned vs the wheel kernel on the c64 replay
+                (all 5 layers, residual = bf16 output rounding only)
+      o       = p @ k   (V = the same decoded row; o's last 64 dims are
+                roped — the caller applies the inverse rope, A1c)
+
+    Gradients (fp32-smooth): dQ (closed form), dSink, and dK handed to the
+    K-store / compressor shadow latents through the case-B STE (identity on
+    the dequantized values).  The index tables are DISCRETE STATES saved
+    from forward, never recomputed.  Attended locs with no shadow row
+    (constants — rows written by earlier steps) contribute to the
+    recompute VALUES but receive no gradient.
+
+    Shadow-row mapping: ``row_locs_swa``/``row_locs_extra`` give the pool
+    loc each shadow row was written to this step; ``spec`` carries
+    ``kernel_call(q) -> o`` plus {"sm_scale", "page_swa", "page_extra"}.
+    """
+
+    @staticmethod
+    def forward(ctx, q, sink, shadow_swa, shadow_extra, pool_swa,
+                pool_extra, row_locs_swa, row_locs_extra, swa_idx, swa_len,
+                extra_idx, extra_len, spec):
+        o = spec["kernel_call"](q)
+        ctx.save_for_backward(q, sink, pool_swa, pool_extra,
+                              row_locs_swa, row_locs_extra,
+                              swa_idx, swa_len, extra_idx, extra_len)
+        ctx.spec = spec
+        ctx.shadow_dtypes = (
+            None if shadow_swa is None else shadow_swa.dtype,
+            None if shadow_extra is None else shadow_extra.dtype,
+        )
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        (q, sink, pool_swa, pool_extra, row_locs_swa, row_locs_extra,
+         swa_idx, swa_len, extra_idx, extra_len) = ctx.saved_tensors
+        sm = ctx.spec["sm_scale"]
+        page_s = ctx.spec["page_swa"]
+        page_e = ctx.spec["page_extra"]
+        T, H, D = q.shape
+        dev = q.device
+        do32 = do.detach().float()
+        q32 = q.detach().float()
+        sink32 = sink.detach().float()
+
+        def pad_table(idx, lens):
+            idx = idx.to(dev)
+            valid = ((torch.arange(idx.shape[1], device=dev).unsqueeze(0)
+                      < lens.to(dev).unsqueeze(1)) & (idx >= 0))
+            return idx.clamp(min=0).long(), valid
+
+        loc_s, val_s = pad_table(swa_idx, swa_len)
+        if extra_idx is not None and extra_idx.shape[-1] > 0:
+            loc_e, val_e = pad_table(extra_idx, extra_len)
+        else:
+            loc_e = torch.zeros(T, 0, device=dev, dtype=torch.long)
+            val_e = torch.zeros(T, 0, device=dev, dtype=torch.bool)
+
+        def pool_state(pool, locs2d, valid, page):
+            """decode rows + per-(t,slot) decode-row index (or -1)."""
+            if pool is None or int(valid.sum()) == 0:
+                # 1-row dummy when the table has slots but none valid, so
+                # the clamped gather below stays in bounds (masked anyway)
+                return (torch.zeros(1 if locs2d.numel() else 0, D,
+                                    device=dev),
+                        torch.full(locs2d.shape, -1, device=dev,
+                                   dtype=torch.long))
+            uloc, inv = torch.unique(locs2d[valid], return_inverse=True)
+            K_u = _v4_decode_rows(pool, uloc, page)
+            row = torch.full(locs2d.shape, -1, device=dev, dtype=torch.long)
+            row[valid] = inv
+            return K_u, row
+
+        K_s, row_s = pool_state(pool_swa, loc_s, val_s, page_s)
+        K_e, row_e = pool_state(pool_extra, loc_e, val_e, page_e)
+        # gather [T, L, D]; invalid lanes point at decode row 0 and are
+        # masked out of the softmax below.
+        Kg = torch.cat([K_s[row_s.clamp(min=0)],
+                        K_e[row_e.clamp(min=0)]], dim=1)
+        val = torch.cat([val_s, val_e], dim=1)
+
+        s = sm * torch.einsum("thd,tld->thl", q32, Kg)
+        s = s.masked_fill(~val.unsqueeze(1), float("-inf"))
+        m = s.amax(-1, keepdim=True)                           # [T,H,1]
+        e = torch.exp(s - m)                                  # 0 on invalid
+        Eterm = torch.exp(sink32.view(1, H) - m.squeeze(-1))  # [T,H]
+        Z = e.sum(-1) + Eterm                                 # [T,H]
+        p = e / Z.unsqueeze(-1)                               # [T,H,L]
+
+        dP = torch.einsum("thd,tld->thl", do32, Kg)           # [T,H,L]
+        beta = (p * dP).sum(-1)                               # [T,H]
+        ds = p * (dP - beta.unsqueeze(-1))                    # 0 on invalid
+        dq = sm * torch.einsum("thl,tld->thd", ds, Kg)        # [T,H,D]
+        o_rc = torch.einsum("thl,tld->thd", p, Kg)            # [T,H,D]
+        dsink = -((Eterm / Z) * (do32 * o_rc).sum(-1)).sum(0)  # [H]
+        # dK has TWO paths (K is both the value rows AND the score keys):
+        # the V path p^T do plus the score path sm * ds^T q.
+        dk = (torch.einsum("thl,thd->tld", p, do32)
+              + sm * torch.einsum("thl,thd->tld", ds, q32))  # [T,L,D]
+
+        def grad_rows(pool, locs2d, valid, page, row, row_locs, dk_full):
+            """dK in decode-row space -> shadow-row space (index_add)."""
+            if pool is None or int(valid.sum()) == 0 \
+                    or row_locs is None:
+                return None
+            uloc, _ = torch.unique(locs2d[valid], return_inverse=True)
+            rl = row_locs.to(dev).long()
+            order = torch.argsort(rl)
+            slocs = rl[order]
+            pos = torch.searchsorted(slocs, uloc)
+            pos_c = pos.clamp(max=slocs.shape[0] - 1)
+            hit = slocs[pos_c] == uloc
+            dec2sh = torch.where(hit, order[pos_c],
+                                 torch.full_like(order[pos_c], -1))
+            sh = dec2sh[row]                                  # [T,L] or -1
+            m2 = valid & (sh >= 0)
+            if int(m2.sum()) == 0:
+                return None
+            g = torch.zeros(rl.shape[0], D, device=dev)
+            return g.index_add_(0, sh[m2], dk_full[m2])
+
+        g_s = grad_rows(pool_swa, loc_s, val_s, page_s, row_s,
+                        row_locs_swa, dk[:, :loc_s.shape[1]])
+        g_e = grad_rows(pool_extra, loc_e, val_e, page_e, row_e,
+                        row_locs_extra, dk[:, loc_s.shape[1]:])
+
+        if _A3_DEBUG is not None:
+            _A3_DEBUG["g_s"] = None if g_s is None else g_s.detach()
+            _A3_DEBUG["g_e"] = None if g_e is None else g_e.detach()
+            _A3_DEBUG["p"] = p.detach()
+            _A3_DEBUG["ds"] = ds.detach()
+        dt_s, dt_e = ctx.shadow_dtypes
+        grads = [dq.to(q.dtype), dsink.to(sink.dtype),
+                 None if g_s is None else g_s.to(dt_s),
+                 None if g_e is None else g_e.to(dt_e)]
+        grads.extend([None] * 9)  # pools / locs / tables / spec
+        return tuple(grads)

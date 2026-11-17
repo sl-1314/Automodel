@@ -299,6 +299,11 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
 
     def _aligned_thread(self, histories, static, fw):
         import deep_gemm  # noqa: F401
+        from nemo_automodel.components.models.deepseek_v4.backward_glue import (
+            BoundaryFn, FusedExpertsFn, GateFn, HashTopkFn, HcBroadcastFn,
+            HcHeadFn, LinearBF16FP32Fn, MhcPostFn, MhcPreFn, RmsNormFn,
+            SiluClampFn,
+        )
         from sglang.kernels.ops.attention import flash_mla_interface
         from sglang.kernels.ops.attention.dsv4 import (
             compress_forward, fused_q_indexer_rope_hadamard_quant,
@@ -309,27 +314,11 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
             fused_k_norm_rope_flashmla, fused_q_norm_rope, fused_rope_inplace,
         )
         from sglang.srt.layers.attention.dsv4 import compressor_v2 as cv2
-        from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
-        from sglang.kernels.ops.activation.silu_and_mul_clamp import (
-            silu_and_mul_clamp,
-        )
-        from sglang.kernels.ops.layernorm.mhc import hc_broadcast, mhc_post, mhc_pre
-        from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
-        from sglang.kernels.ops.moe.dsv4 import hash_topk
-        from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
         from sglang.srt.batch_invariant_ops import (
             is_batch_invariant_mode_enabled,
-            rms_norm_batch_invariant,
         )
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             _create_flashmla_metadata, _fill_deterministic_flashmla_sched,
-        )
-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-            fused_experts,
-        )
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
-        from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
-            apply_mhc_post_pre_boundary,
         )
         from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 
@@ -390,7 +379,7 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
 
         # ---- 0) token ids -> hs_init --------------------------------------
         emb = F.embedding(flat_ids.cuda(), fw("model.embed_tokens.weight"))
-        hs_init = hc_broadcast(emb, cfg["hc_mult"])
+        hs_init = HcBroadcastFn.apply(emb, cfg["hc_mult"])
 
         state = {"streams": hs_init, "post": None, "comb": None}
         hash_j, gate_j = 0, 0
@@ -406,18 +395,18 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
                 # module slot) — replicate values + dtype exactly.
                 w_iln = fw("model.layers.0.input_layernorm.weight") \
                     .to(iln_dtype).to(torch.float32)
-                post0, comb0, y = mhc_pre(
-                    residual=state["streams"],
-                    fn=fw("model.layers.0.hc_attn_fn"),
-                    hc_scale=fw("model.layers.0.hc_attn_scale"),
-                    hc_base=fw("model.layers.0.hc_attn_base"),
-                    rms_eps=cfg["rms_norm_eps"],
-                    hc_pre_eps=cfg["hc_eps"],
-                    hc_sinkhorn_eps=cfg["hc_eps"],
-                    hc_post_mult_value=MHC_POST_MULT_VALUE,
-                    sinkhorn_repeat=cfg["hc_sinkhorn_iters"],
-                    norm_weight=w_iln,
-                    norm_eps=cfg["rms_norm_eps"],
+                post0, comb0, y = MhcPreFn.apply(
+                    state["streams"],
+                    fw("model.layers.0.hc_attn_fn"),
+                    fw("model.layers.0.hc_attn_scale"),
+                    fw("model.layers.0.hc_attn_base"),
+                    w_iln,
+                    cfg["rms_norm_eps"],   # rms_eps
+                    cfg["hc_eps"],         # hc_pre_eps
+                    cfg["hc_eps"],         # hc_sinkhorn_eps
+                    MHC_POST_MULT_VALUE,
+                    cfg["hc_sinkhorn_iters"],
+                    cfg["rms_norm_eps"],   # norm_eps
                 )
                 x_attn = y
                 state["post"], state["comb"] = post0.squeeze(-1), comb0
@@ -425,7 +414,7 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
                 fused = self._glue_fused(
                     state["value"], state["streams"], state["post"],
                     state["comb"], i, "attn", fw, cfg,
-                    apply_mhc_post_pre_boundary, MHC_POST_MULT_VALUE)
+                    BoundaryFn, MHC_POST_MULT_VALUE)
                 g_streams, x_attn, g_post, g_comb, _ = fused
                 state.update(streams=g_streams, post=g_post, comb=g_comb)
 
@@ -443,7 +432,7 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
             w_qn = fw(f"model.layers.{i}.self_attn.q_norm.weight") \
                 .to(_td(static["norm_dtypes"][i]["q_norm"])) \
                 .to(torch.float32)
-            q_lora = rms_norm_batch_invariant(
+            q_lora = RmsNormFn.apply(
                 qkv_a[..., : cfg["q_lora_rank"]], w_qn, cfg["rms_norm_eps"])
             q = F.linear(q_lora, fw(f"model.layers.{i}.self_attn.wq_b.weight")) \
                 .view(-1, cfg["num_attention_heads"], cfg["head_dim"])
@@ -489,7 +478,7 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
                     w_wkv = fw(f"model.layers.{i}.{pfx}.wkv_gate.weight")
                     w_norm = fw(f"model.layers.{i}.{pfx}.norm.weight")
                     w_ape = _ape_hotfix(fw(f"model.layers.{i}.{pfx}.ape"))
-                    kv_score_input = linear_bf16_fp32(x_attn, w_wkv)
+                    kv_score_input = LinearBF16FP32Fn.apply(x_attn, w_wkv)
                     ksm = static["kv_score_meta"][key]
                     zstate = torch.zeros(ksm["shape"], dtype=_td(ksm["dtype"]),
                                          device="cuda")
@@ -601,7 +590,7 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
             # ---- 3) ffn boundary -> x_mlp ----------------------------------
             fused = self._glue_fused(
                 attn_out, state["streams"], state["post"], state["comb"],
-                i, "ffn", fw, cfg, apply_mhc_post_pre_boundary,
+                i, "ffn", fw, cfg, BoundaryFn,
                 MHC_POST_MULT_VALUE)
             g_streams, x_mlp, g_post, g_comb, _ = fused
             state.update(streams=g_streams, post=g_post, comb=g_comb)
@@ -611,25 +600,31 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
             sh_u = fw(f"model.layers.{i}.mlp.shared_experts.up_proj.weight")
             sh_d = fw(f"model.layers.{i}.mlp.shared_experts.down_proj.weight")
             gate_up = F.linear(x_mlp, torch.cat([sh_g, sh_u], dim=0))
-            act = gate_up.new_empty((x_mlp.shape[0], gate_up.shape[1] // 2))
-            silu_and_mul_clamp(gate_up, act, 10.0)
+            act = SiluClampFn.apply(gate_up, 10.0)
             shared_glue = F.linear(act, sh_d)
 
             gate_w = fw(f"model.layers.{i}.mlp.gate.weight")
-            logits_glue = linear_bf16_fp32(x_mlp, gate_w)
+            logits_glue = LinearBF16FP32Fn.apply(x_mlp, gate_w)
             if is_hash[i]:
                 hc = hash_calls[hash_j]
                 tid2eid = hc["tid2eid"].cuda()
-                w_g, ids_g = hash_topk(logits_glue, hc["input_ids"].cuda(),
-                                       tid2eid, *hc["a"], **hc["kw"])
+                w_g, ids_g = HashTopkFn.apply(
+                    logits_glue, hc["input_ids"].cuda(), tid2eid,
+                    hc["kw"]["num_fused_shared_experts"],
+                    hc["kw"]["routed_scaling_factor"],
+                    hc["kw"]["scoring_func"])
                 hash_j += 1
             else:
                 gc = gate_calls[gate_j]
                 bias_g = fw(
                     f"model.layers.{i}.mlp.gate.e_score_correction_bias"
                 ).float()
-                w_g, ids_g = moe_fused_gate(logits_glue, bias_g, gc["topk"],
-                                            *gc["a"], **gc["kw"])
+                w_g, ids_g = GateFn.apply(
+                    logits_glue, bias_g, gc["topk"], gc["kw"]["scoring_func"],
+                    gc["kw"]["num_fused_shared_experts"],
+                    gc["kw"]["renormalize"],
+                    gc["kw"]["routed_scaling_factor"],
+                    gc["kw"]["apply_routed_scaling_factor_on_output"])
                 gate_j += 1
 
             gs = torch.stack([fw(f"model.layers.{i}.mlp.experts.{e}.gate_proj"
@@ -639,10 +634,10 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
             ds = torch.stack([fw(f"model.layers.{i}.mlp.experts.{e}.down_proj"
                                  ".weight") for e in range(8)])
             w13 = torch.cat([gs, us], dim=1)
-            topk_output = StandardTopKOutput(w_g, ids_g, logits_glue)
-            # fused_experts is in-place on hidden_states — feed a clone
-            routed_glue = fused_experts(x_mlp.clone(), w13, ds,
-                                        topk_output, mrc[i])
+            # fused_experts is in-place on hidden_states — the glue feeds it
+            # a clone (value path unchanged); backward recomputes per-slot.
+            routed_glue = FusedExpertsFn.apply(x_mlp, w13, ds, w_g, ids_g,
+                                               logits_glue, mrc[i])
             merged = routed_glue.clone()
             merged += shared_glue
             state["value"] = merged
@@ -655,20 +650,19 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
             torch.cuda.empty_cache()
 
         # ---- 5) final read + tail -----------------------------------------
-        R = mhc_post(state["value"], state["streams"], state["post"],
-                     state["comb"])
-        y = fused_hc_head(
+        R = MhcPostFn.apply(state["value"], state["streams"], state["post"],
+                            state["comb"])
+        y = HcHeadFn.apply(
             R.view(R.shape[0], cfg["hc_mult"], cfg["hidden_size"]).contiguous(),
             fw("model.hc_head_fn"),
             fw("model.hc_head_scale"),
             fw("model.hc_head_base"),
-            norm_eps=cfg["rms_norm_eps"],
-            hc_eps=cfg["hc_eps"],
+            cfg["rms_norm_eps"], cfg["hc_eps"],
         )
         # final RMSNorm: the engine consumes the weight in the fp32 module
         # slot (file fp32 values); the batch-invariant kernel is called
         # directly so the weight stays grad-connected.
-        states = rms_norm_batch_invariant(
+        states = RmsNormFn.apply(
             y, fw("model.norm.weight").to(torch.float32),
             cfg["rms_norm_eps"])
         # lm-head: bf16 GEMM (bf16 rounding) -> value-exact fp32 upcast, the
@@ -682,19 +676,21 @@ class DeepseekV4ForCausalLMAligned(DeepseekV4ForCausalLM):
 
     @staticmethod
     def _glue_fused(value, streams, post, comb, i, kind, fw, cfg,
-                    apply_mhc_post_pre_boundary, MHC_POST_MULT_VALUE):
+                    BoundaryFn, MHC_POST_MULT_VALUE):
         mod = "input_layernorm" if kind == "attn" \
             else "post_attention_layernorm"
-        return apply_mhc_post_pre_boundary(
+        # BoundaryFn pins fn_transpose=False: on CUDA (H20) the fused
+        # boundary takes the TileLang path, which consumes hc_fn as passed
+        # for both kinds (fn_transpose only gates the gfx95 route).
+        return BoundaryFn.apply(
             value, streams, post, comb,
             fw(f"model.layers.{i}.hc_{kind}_fn"),
             fw(f"model.layers.{i}.hc_{kind}_scale"),
             fw(f"model.layers.{i}.hc_{kind}_base"),
+            fw(f"model.layers.{i}.{mod}.weight").to(torch.bfloat16),
             cfg["hc_mult"], cfg["rms_norm_eps"], cfg["hc_eps"],
             MHC_POST_MULT_VALUE, cfg["hc_sinkhorn_iters"],
-            fw(f"model.layers.{i}.{mod}.weight").to(torch.bfloat16),
             cfg["rms_norm_eps"],
-            fn_transpose=(kind == "ffn"),
         )
 
 

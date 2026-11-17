@@ -821,3 +821,84 @@ class FlashMlaFn(torch.autograd.Function):
                  None if g_e is None else g_e.to(dt_e)]
         grads.extend([None] * 9)  # pools / locs / tables / spec
         return tuple(grads)
+
+
+# ===================== A1b: K-store (norm+rope+fp8+paged write) ===========
+#
+# Kernel (main_norm_rope.cuh fused_k_norm_rope_flashmla, V4 layout):
+#   norm over the FULL head (512 dims, rope tail included):
+#     r = rsqrt(sum(x^2)/512 + eps);  y = x * r * w     (w = kv_norm)
+#   nope dims [0:448): per-warp (64-dim group) ue8m0 fp8 quant of the
+#     fp32 y (scale = max(1e-4, groupmax)/448, ceil to pow2), paged store
+#   rope dims [448:512): fp32 complex rotation, rounded to bf16, stored raw
+#   rows with out_loc < 0 are skipped (no write).
+#
+# STE case-B contract (skill 02 default): the fp8 quant is identity in
+# backward -- the incoming grad is the grad on the DEQUANTIZED values, i.e.
+# on the pre-quant latent.  The shadow edge between this Function and
+# FlashMlaFn stays fp32 (fp32-smooth: the only boundary rounding is the
+# cast back to the kv leaf's dtype).
+
+
+class KNormRopeStoreFn(torch.autograd.Function):
+    """A1b: ``fused_k_norm_rope_flashmla`` as a case-B STE.
+
+    Forward calls the engine kernel (the paged fp8 pool write is bitwise --
+    c59b) and returns the PRE-QUANT shadow latent [T, 512] fp32 (torch
+    recompute of the kernel's norm+rope).  The shadow is a graph EDGE for
+    FlashMlaFn: its backward consumes pool bytes, never shadow values, so
+    the torch recompute's value is advisory (the kernel ropes from fp32 and
+    quantizes the fp32 nope directly; the reference rounds the roped tail
+    to bf16 exactly as the kernel stores it).
+
+    Backward: STE identity through the quant, inverse rotation on the tail
+    (conjugate), then the weighted-RMSNorm VJP -- all recomputed fp32-smooth
+    from the saved kv (single upcast), cast back to the kv/weight dtypes.
+    freqs layout: see _FREQS_DOC.
+    """
+
+    @staticmethod
+    def forward(ctx, kv, kv_weight, eps, freqs_cis, positions, out_loc,
+                kvcache, page_size, layout):
+        from sglang.kernels.ops.attention.dsv4.norm_rope import (
+            fused_k_norm_rope_flashmla,
+        )
+        fused_k_norm_rope_flashmla(
+            kv=kv, kv_weight=kv_weight, eps=eps, freqs_cis=freqs_cis,
+            positions=positions, out_loc=out_loc, kvcache=kvcache,
+            page_size=page_size, layout=layout)
+        with torch.no_grad():
+            kv32 = kv.float()
+            D = kv.shape[-1]
+            r = torch.rsqrt(kv32.square().mean(-1, keepdim=True) + eps)
+            y = kv32 * r * kv_weight.float()
+            cos, sin = _rope_freqs(freqs_cis, positions)   # [T, R/2]
+            R = cos.shape[-1] * 2
+            tail = y[:, D - R:].unflatten(-1, (R // 2, 2))
+            rot = _rotate_pairs(tail, cos, sin, inverse=False)
+            shadow = torch.cat([y[:, :D - R], rot.flatten(-2)], dim=-1)
+        ctx.save_for_backward(kv, kv_weight, positions)
+        ctx.eps = eps
+        ctx.freqs_cis = freqs_cis.detach()
+        return shadow
+
+    @staticmethod
+    def backward(ctx, grad_shadow):
+        kv, kv_weight, positions = ctx.saved_tensors
+        D = kv.shape[-1]
+        with torch.enable_grad():
+            kv_l = kv.detach().requires_grad_(True)
+            w_l = kv_weight.detach().requires_grad_(True)
+            kv32 = kv_l.float()
+            r = torch.rsqrt(kv32.square().mean(-1, keepdim=True)
+                            + ctx.eps)
+            y = kv32 * r * w_l.float()
+            cos, sin = _rope_freqs(ctx.freqs_cis, positions)
+            R = cos.shape[-1] * 2
+            tail = y[:, D - R:].unflatten(-1, (R // 2, 2))
+            rot = _rotate_pairs(tail, cos, sin, inverse=False)
+            shadow = torch.cat([y[:, :D - R], rot.flatten(-2)], dim=-1)
+            g_kv, g_w = torch.autograd.grad(shadow, (kv_l, w_l),
+                                            grad_shadow.float())
+        return (g_kv.to(kv.dtype), g_w.to(kv_weight.dtype),
+                None, None, None, None, None, None, None)

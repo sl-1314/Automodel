@@ -524,3 +524,113 @@ class FusedExpertsFn(torch.autograd.Function):
             out.append(None if g is None else g.to(t.dtype))
         # pad for topk_ids / router_logits / mrc (non-tensor grad targets)
         return tuple(out) + (None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# C6 stage 2 — attention middle (A1 norm_rope family).  The Functions are
+# math-validated per module (VJP checks); the aligned.py wiring lands when
+# the whole attention middle is grad-transparent (flash_mla A3 unblocks the
+# flow — wiring norm_rope alone would not change the c64 probe).
+
+_FREQS_DOC = """freqs_cis is complex64 [max_pos, rope_dim/2]; the kernels
+read the REAL view (re, im interleaved) so pair j = elements (2j, 2j+1)
+rotated by (cos_j, sin_j) = freqs_real[pos, 2j:2j+2] (verified against
+main_norm_rope.cuh fused_q_norm_rope and rope.cuh deepseek_rope_kernel)."""
+
+
+def _rope_freqs(freqs_cis: torch.Tensor, positions: torch.Tensor):
+    """Gather per-token (cos, sin) pairs [T, rope_dim/2] each, fp32."""
+    fr = torch.view_as_real(freqs_cis.detach()).flatten(-2)  # [P, R] (re,im)
+    f = fr[positions.long()]                                  # [T, R]
+    return f[..., 0::2], f[..., 1::2]                         # cos, sin
+
+
+def _rotate_pairs(x_pairs: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                  inverse: bool):
+    """x_pairs [..., R/2, 2] (real, imag per pair) -> rotated, fp32 in/out.
+
+    forward:  out = (x_r*c - x_i*s, x_r*s + x_i*c)
+    inverse:  out = (x_r*c + x_i*s, x_i*c - x_r*s)   (conjugate multiply)
+    """
+    xr, xi = x_pairs[..., 0], x_pairs[..., 1]
+    if inverse:
+        return torch.stack((xr * cos + xi * sin, xi * cos - xr * sin), -1)
+    return torch.stack((xr * cos - xi * sin, xr * sin + xi * cos), -1)
+
+
+class QNormRopeFn(torch.autograd.Function):
+    """A1a: fused_q_norm_rope — per-head WEIGHTLESS RMSNorm (q_norm is
+    folded as the norm-self scale; the q path passes eps only), then RoPE
+    on the last rope_dim elements.  Forward = the kernel (bitwise value
+    path); backward = closed-form VJP recomputed fp32-smooth from the
+    saved q (norm-self VJP + inverse rotation).  freqs layout: see _FREQS_DOC"""
+
+    @staticmethod
+    def forward(ctx, q, eps, freqs_cis, positions):
+        from sglang.kernels.ops.attention.dsv4.norm_rope import (
+            fused_q_norm_rope,
+        )
+        q_out = torch.empty_like(q)
+        fused_q_norm_rope(q, q_out, eps, freqs_cis, positions)
+        ctx.save_for_backward(q, positions)
+        ctx.eps = eps
+        ctx.freqs_cis = freqs_cis.detach()
+        return q_out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, positions = ctx.saved_tensors
+        D = q.shape[-1]
+        with torch.enable_grad():
+            q_l = q.detach().requires_grad_(True)
+            q32 = q_l.float()                                  # [T,H,D]
+            r = torch.rsqrt(q32.square().mean(-1, keepdim=True)
+                            + ctx.eps)
+            xn = q32 * r
+            cos, sin = _rope_freqs(ctx.freqs_cis, positions)   # [T,R/2]
+            cos = cos.view(-1, *([1] * (q.dim() - 2)), cos.shape[-1])
+            sin = sin.view(-1, *([1] * (q.dim() - 2)), sin.shape[-1])
+            tail = xn[..., D - cos.shape[-1] * 2:] \
+                .unflatten(-1, (cos.shape[-1], 2))
+            rot = _rotate_pairs(tail, cos, sin, inverse=False)
+            out = torch.cat(
+                [xn[..., :D - cos.shape[-1] * 2],
+                 rot.flatten(-2)], dim=-1)
+            g = torch.autograd.grad(out, (q_l,), grad_out.float())[0]
+        return g.to(q.dtype), None, None, None
+
+
+class RopeInplaceFn(torch.autograd.Function):
+    """A1c: fused_rope_inplace (the O-side inverse rope on the tail slice).
+    The map is a pure rotation (linear, orthogonal): the VJP is the
+    OPPOSITE-orientation rotation of grad_out — no saved tensors needed.
+    Forward calls the kernel on a clone (the aligned value path replaces
+    the in-place slice mutation with `o = cat([o[..., :-R], out], -1)`,
+    values identical).  freqs layout: see _FREQS_DOC"""
+
+    @staticmethod
+    def forward(ctx, tail, freqs_cis, positions, inverse):
+        from sglang.kernels.ops.attention.dsv4.norm_rope import (
+            fused_rope_inplace,
+        )
+        out = tail.clone()
+        fused_rope_inplace(out, None, freqs_cis, positions, inverse)
+        ctx.save_for_backward(positions)
+        ctx.freqs_cis = freqs_cis.detach()
+        ctx.inverse = inverse
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (positions,) = ctx.saved_tensors
+        cos, sin = _rope_freqs(ctx.freqs_cis, positions)       # [T,R/2]
+        # broadcast [T,1,...,R/2] over the head dims
+        cos = cos.view(cos.shape[0], *([1] * (grad_out.dim() - 2)),
+                       cos.shape[-1])
+        sin = sin.view(sin.shape[0], *([1] * (grad_out.dim() - 2)),
+                       sin.shape[-1])
+        g = grad_out.float().unflatten(-1, (cos.shape[-1], 2))
+        # VJP of a rotation = conjugate rotation; forward used `inverse`,
+        # so backward uses the opposite orientation.
+        dx = _rotate_pairs(g, cos, sin, inverse=not ctx.inverse)
+        return dx.flatten(-2).to(grad_out.dtype), None, None, None
